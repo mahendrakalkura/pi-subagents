@@ -5,20 +5,22 @@
  * Responsive two-pane layout:
  * - Left pane: Roster table with aggregate header, status badges, model tags, metrics,
  *   current activity, and tree hierarchy toggle ('t').
- * - Right pane: Live inspector showing context window gauge, tool parameters, last response,
- *   lineage, and output/worktree artifacts.
+ * - Right pane: Live inspector showing context window gauge, lineage, and a live,
+ *   scrollable transcript of conversation, tool calls, arguments, and streaming output.
  *
  * Controls:
- * - j / k, Up / Down: select agent
+ * - j / k, Up / Down: navigate selection (or scroll transcript if inspector is focused)
+ * - Tab: toggle focus between roster and inspector (or switch views on narrow terminals)
+ * - PageUp / PageDown: scroll transcript in inspector
+ * - Home / End: scroll to top / bottom of transcript
  * - t: toggle flat vs tree view
- * - Tab: toggle inspector on narrow terminals (< 96 cols)
- * - PageUp / PageDown: scroll inspector
  * - r: revive / resume parked agent
  * - x: abort / kill running agent
- * - Enter: open conversation viewer
+ * - Enter: open full conversation viewer
  * - Esc / Alt+A: close Hub
  */
 
+import { existsSync, readFileSync } from "node:fs";
 import {
   type Component,
   isKeyRelease,
@@ -31,20 +33,18 @@ import {
   wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import type { AgentManager } from "../agent-manager.js";
-import type { AgentRecord, ViewerMarkdownMode } from "../types.js";
-import { getLifetimeCost, getLifetimeTotal, getSessionContextPercent } from "../usage.js";
+import { extractText } from "../context.js";
+import type { AgentRecord } from "../types.js";
+import { getLifetimeCost, getLifetimeTotal } from "../usage.js";
 import {
   type AgentActivity,
-  describeActivity,
   formatCost,
-  formatDuration,
   formatTokens,
   type Theme,
 } from "./agent-widget.js";
-import { ConversationViewer, VIEWPORT_HEIGHT_PCT } from "./conversation-viewer.js";
 
-const SPLIT_MIN_WIDTH = 96;
-const ROSTER_MIN_WIDTH = 48;
+const SPLIT_MIN_WIDTH = 84;
+const ROSTER_MIN_WIDTH = 38;
 const DETAIL_MIN_WIDTH = 34;
 const TICK_MS = 200;
 
@@ -89,13 +89,20 @@ function fit(text: string, width: number): string {
   return cw < width ? cut + padding(width - cw) : cut;
 }
 
-function alignRight(text: string, width: number): string {
-  const w = visibleWidth(text);
-  return padding(Math.max(0, width - w)) + text;
+export function formatElapsed(ms: number): string {
+  if (!ms || ms <= 0 || !Number.isFinite(ms)) return "0s";
+  const totalSecs = Math.round(ms / 1000);
+  if (totalSecs < 60) return `${totalSecs}s`;
+  const mins = Math.floor(totalSecs / 60);
+  const secs = totalSecs % 60;
+  if (mins < 60) return `${mins}m ${secs}s`;
+  const hours = Math.floor(mins / 60);
+  const remMins = mins % 60;
+  return `${hours}h ${remMins}m`;
 }
 
 export function contextGauge(tokens: number, window: number, theme: Theme): string {
-  if (window <= 0) return `${tokens} tok`;
+  if (window <= 0) return `${formatTokens(tokens)} tok`;
   const ratio = Math.max(0, Math.min(1, tokens / window));
   const filled = Math.round(ratio * 10);
   const bar = theme.fg("accent", "━".repeat(filled)) + theme.fg("dim", "─".repeat(10 - filled));
@@ -220,8 +227,10 @@ export class AgentHub implements Component {
   private timer: ReturnType<typeof setInterval> | undefined;
   private selectedIndex = 0;
   private viewMode: "roster" | "tree" = "roster";
+  private activePane: "roster" | "inspector" = "roster";
   private narrowDetailsOpen = false;
   private detailScrollOffset = 0;
+  private autoScroll = true;
   private lastRenderWidth = 80;
   private lastRenderHeight = 24;
   private notice: string | undefined;
@@ -271,7 +280,6 @@ export class AgentHub implements Component {
         lastSiblingById: projection.lastSiblingById,
       };
     }
-    // Roster view: newest / active first
     const records = [...raw].sort((a, b) => {
       const aRunning = a.status === "running" ? 0 : 1;
       const bRunning = b.status === "running" ? 0 : 1;
@@ -309,7 +317,7 @@ export class AgentHub implements Component {
         requests += activity.turnCount || 0;
         tools += activity.toolUses || 0;
       }
-      const dur = r.completedAt ? r.completedAt - r.startedAt : now - r.startedAt;
+      const dur = (r.completedAt ?? now) - r.startedAt;
       if (dur > 0) durationMs += dur;
     }
 
@@ -368,7 +376,7 @@ export class AgentHub implements Component {
   handleInput(data: string): void {
     if (isKeyRelease(data)) return;
 
-    // Alt+A or Esc or Ctrl+S: close Hub
+    // Alt+A or Esc or Ctrl+S
     if (
       matchesKey(data, "alt+a") ||
       matchesKey(data, "escape") ||
@@ -381,6 +389,11 @@ export class AgentHub implements Component {
         this.tui.requestRender();
         return;
       }
+      if (this.activePane === "inspector") {
+        this.activePane = "roster";
+        this.tui.requestRender();
+        return;
+      }
       this.done();
       return;
     }
@@ -388,11 +401,62 @@ export class AgentHub implements Component {
     const { records } = this.getOrderedRecords();
     const count = records.length;
 
-    // Up / Down navigation
+    // Tab toggles active pane or narrow view
+    if (matchesKey(data, Key.tab)) {
+      if (this.lastRenderWidth >= SPLIT_MIN_WIDTH) {
+        this.activePane = this.activePane === "roster" ? "inspector" : "roster";
+      } else {
+        this.narrowDetailsOpen = !this.narrowDetailsOpen;
+      }
+      this.tui.requestRender();
+      return;
+    }
+
+    // When inspector pane is active in split mode, or narrowDetails is open:
+    if (this.activePane === "inspector" || this.narrowDetailsOpen) {
+      if (matchesKey(data, "down") || matchesKey(data, "j")) {
+        this.detailScrollOffset++;
+        this.autoScroll = false;
+        this.tui.requestRender();
+        return;
+      }
+      if (matchesKey(data, "up") || matchesKey(data, "k")) {
+        this.detailScrollOffset = Math.max(0, this.detailScrollOffset - 1);
+        this.autoScroll = false;
+        this.tui.requestRender();
+        return;
+      }
+      if (matchesKey(data, Key.pageDown)) {
+        this.detailScrollOffset += 6;
+        this.tui.requestRender();
+        return;
+      }
+      if (matchesKey(data, Key.pageUp)) {
+        this.detailScrollOffset = Math.max(0, this.detailScrollOffset - 6);
+        this.autoScroll = false;
+        this.tui.requestRender();
+        return;
+      }
+      if (matchesKey(data, "home")) {
+        this.detailScrollOffset = 0;
+        this.autoScroll = false;
+        this.tui.requestRender();
+        return;
+      }
+      if (matchesKey(data, "end")) {
+        this.detailScrollOffset = 999999;
+        this.autoScroll = true;
+        this.tui.requestRender();
+        return;
+      }
+    }
+
+    // Up / Down navigation when in roster
     if (matchesKey(data, "down") || matchesKey(data, "j")) {
       if (count > 0) {
         this.selectedIndex = (this.selectedIndex + 1) % count;
         this.detailScrollOffset = 0;
+        this.autoScroll = true;
         this.tui.requestRender();
       }
       return;
@@ -401,6 +465,7 @@ export class AgentHub implements Component {
       if (count > 0) {
         this.selectedIndex = (this.selectedIndex - 1 + count) % count;
         this.detailScrollOffset = 0;
+        this.autoScroll = true;
         this.tui.requestRender();
       }
       return;
@@ -413,21 +478,15 @@ export class AgentHub implements Component {
       return;
     }
 
-    // Tab: toggle inspector on narrow screens
-    if (matchesKey(data, Key.tab)) {
-      this.narrowDetailsOpen = !this.narrowDetailsOpen;
-      this.tui.requestRender();
-      return;
-    }
-
-    // PageUp / PageDown for scrolling inspector
+    // PageUp / PageDown scrolls inspector directly even from roster
     if (matchesKey(data, Key.pageUp)) {
-      this.detailScrollOffset = Math.max(0, this.detailScrollOffset - 4);
+      this.detailScrollOffset = Math.max(0, this.detailScrollOffset - 6);
+      this.autoScroll = false;
       this.tui.requestRender();
       return;
     }
     if (matchesKey(data, Key.pageDown)) {
-      this.detailScrollOffset += 4;
+      this.detailScrollOffset += 6;
       this.tui.requestRender();
       return;
     }
@@ -446,12 +505,11 @@ export class AgentHub implements Component {
     // Revive / Resume agent: r
     if (matchesKey(data, "r")) {
       const selected = records[this.selectedIndex];
-      if (selected && (selected.status === "completed" || selected.status === "aborted")) {
+      if (selected && (selected.status === "completed" || selected.status === "aborted" || selected.status === "stopped")) {
         if (this.onReviveAgent) {
           this.done();
           this.onReviveAgent(selected);
         } else {
-          // Open conversation viewer directly to prompt/steer
           this.done();
           this.onOpenConversation(selected);
         }
@@ -474,7 +532,9 @@ export class AgentHub implements Component {
 
   render(width: number): string[] {
     this.lastRenderWidth = width;
-    const height = Math.max(16, Math.min(36, Math.floor((process.stdout.rows || 30) * 0.82)));
+    const termRows = process.stdout.rows || 30;
+    // Window 80% of terminal height
+    const height = Math.max(14, Math.floor(termRows * 0.80));
     this.lastRenderHeight = height;
 
     const isSplit = width >= SPLIT_MIN_WIDTH;
@@ -485,23 +545,29 @@ export class AgentHub implements Component {
     const aggregate = this.computeAggregate(records);
 
     if (isSplit) {
-      const rosterWidth = Math.max(ROSTER_MIN_WIDTH, Math.min(Math.floor(width * 0.55), width - DETAIL_MIN_WIDTH - 6));
-      const bodyWidth = Math.max(DETAIL_MIN_WIDTH, width - rosterWidth - 5);
+      const rosterWidth = Math.max(ROSTER_MIN_WIDTH, Math.min(Math.floor(width * 0.46), width - DETAIL_MIN_WIDTH - 7));
+      // Formula: rosterWidth + bodyWidth + 7 = width -> bodyWidth = width - rosterWidth - 7
+      const bodyWidth = Math.max(DETAIL_MIN_WIDTH, width - rosterWidth - 7);
 
       const rosterLines = this.renderRosterLines(rosterWidth, contentRows, records, aggregate, depthById, parentById, lastSiblingById);
       const inspectorLines = this.renderInspectorLines(bodyWidth, contentRows, records[this.selectedIndex]);
 
       const lines: string[] = [];
-      lines.push(this.topBorderSplit(width, " Agent Hub (Alt+A) ", rosterWidth));
+      const titleTag = this.activePane === "inspector" ? " Agent Hub · Transcript Focused " : " Agent Hub (Alt+A) ";
+      lines.push(this.topBorderSplit(width, titleTag, rosterWidth));
+
       for (let i = 0; i < contentRows; i++) {
         const left = rosterLines[i] || "";
         const right = inspectorLines[i] || "";
-        lines.push(this.splitRow(left, right, width, rosterWidth, bodyWidth));
+        lines.push(this.splitRow(left, right, rosterWidth, bodyWidth));
       }
       lines.push(this.dividerSplit(width, rosterWidth));
+
       const footerText = this.theme.fg(
         "dim",
-        `j/k:select  t:${this.viewMode === "roster" ? "tree" : "flat"}  r:revive  x:kill  Enter:open  Esc:close`,
+        this.activePane === "inspector"
+          ? "Tab:roster  ↑/↓:scroll transcript  PgUp/PgDn:page  Home/End:top/bot  Esc:roster"
+          : `j/k:select  Tab:transcript  t:${this.viewMode === "roster" ? "tree" : "flat"}  r:revive  x:kill  Enter:full chat  Esc:close`,
       );
       lines.push(this.row(footerText, width));
       lines.push(this.bottomBorder(width));
@@ -522,8 +588,8 @@ export class AgentHub implements Component {
     const footerText = this.theme.fg(
       "dim",
       this.narrowDetailsOpen
-        ? "Tab:roster  PgUp/PgDn:scroll  Enter:open  Esc:roster"
-        : `j/k:select  Tab:details  t:${this.viewMode === "roster" ? "tree" : "flat"}  r/x:manage  Enter:open  Esc:close`,
+        ? "Tab:roster  PgUp/PgDn:scroll  Enter:full chat  Esc:roster"
+        : `j/k:select  Tab:transcript  t:${this.viewMode === "roster" ? "tree" : "flat"}  r:revive  x:kill  Enter:open  Esc:close`,
     );
     lines.push(this.row(footerText, width));
     lines.push(this.bottomBorder(width));
@@ -543,7 +609,7 @@ export class AgentHub implements Component {
   ): string[] {
     const lines: string[] = [];
 
-    // Header aggregate
+    // Header aggregate counts
     const statusSummary = [
       aggregate.running > 0 ? this.theme.fg("accent", `● ${aggregate.running} running`) : undefined,
       aggregate.idle > 0 ? this.theme.fg("warning", `○ ${aggregate.idle} idle`) : undefined,
@@ -551,10 +617,11 @@ export class AgentHub implements Component {
       aggregate.aborted > 0 ? this.theme.fg("error", `✖ ${aggregate.aborted} aborted`) : undefined,
     ].filter(Boolean).join("  ") || this.theme.fg("dim", "0 agents");
 
+    // Header metrics with full "requests" spelled out
     const totalsSummary = [
       this.showCost && aggregate.cost > 0 ? formatCost(aggregate.cost) : undefined,
-      aggregate.durationMs > 0 ? formatDuration(aggregate.durationMs) : undefined,
-      `${aggregate.requests} req`,
+      aggregate.durationMs > 0 ? formatElapsed(aggregate.durationMs) : undefined,
+      `${aggregate.requests} requests`,
       `${aggregate.tools} tools`,
       formatTokens(aggregate.tokens),
     ].filter(Boolean).join(this.theme.fg("dim", " · "));
@@ -600,8 +667,8 @@ export class AgentHub implements Component {
       const modelTag = modelName ? this.theme.fg("dim", `[${modelName}]`) : "";
 
       const now = Date.now();
-      const elapsed = r.completedAt ? r.completedAt - r.startedAt : now - r.startedAt;
-      const elapsedStr = elapsed > 0 ? this.theme.fg("dim", formatDuration(elapsed)) : "";
+      const elapsedMs = (r.completedAt ?? now) - r.startedAt;
+      const elapsedStr = r.startedAt > 0 ? this.theme.fg("dim", formatElapsed(elapsedMs)) : "";
 
       const firstLine = `${cursor}${branch}${glyph} ${styledName} ${modelTag} ${elapsedStr}`;
       lines.push(truncateToWidth(firstLine, width));
@@ -624,7 +691,7 @@ export class AgentHub implements Component {
     return lines.slice(0, rows);
   }
 
-  // ---- Inspector lines ----
+  // ---- Inspector & Live Transcript ----
 
   private renderInspectorLines(width: number, rows: number, record: AgentRecord | undefined): string[] {
     const lines: string[] = [];
@@ -636,15 +703,15 @@ export class AgentHub implements Component {
 
     const activity = this.agentActivity.get(record.id);
 
-    // Title / Identity
+    // Identity and status header
     lines.push(this.theme.bold(this.theme.fg("accent", `Agent: ${record.handle || record.id}`)));
-    lines.push(`${this.statusBadge(record.status)}  ${this.theme.fg("dim", `Type: ${record.type}`)}`);
+    const now = Date.now();
+    const runtimeStr = record.startedAt > 0 ? formatElapsed((record.completedAt ?? now) - record.startedAt) : "";
+    lines.push(`${this.statusBadge(record.status)}  ${this.theme.fg("dim", `(${runtimeStr})`)}  ${this.theme.fg("dim", `Type: ${record.type}`)}`);
 
     if (record.description) {
-      lines.push(this.theme.fg("dim", "Task: ") + sanitizeDisplayText(record.description));
+      lines.push(this.theme.fg("dim", "Task: ") + truncateToWidth(sanitizeDisplayText(record.description), width - 6));
     }
-
-    lines.push(this.theme.fg("dim", "─".repeat(width)));
 
     // Model & Reasoning
     const modelObj = record.session?.model;
@@ -659,49 +726,127 @@ export class AgentHub implements Component {
       const cst = getLifetimeCost(usage);
       lines.push(this.theme.bold("Usage: ") + `${formatTokens(tok)} tok · ${formatCost(cst)}`);
 
-      // Context gauge if contextWindow is known on model
       const contextWindow = (modelObj as any)?.contextWindow || 200_000;
       lines.push(this.theme.bold("Context: ") + contextGauge(tok, contextWindow, this.theme));
     }
 
-    // Active tool / Intent
-    if (activity) {
-      lines.push(
-        this.theme.bold("Execution: ") +
-          `${activity.turnCount || 0} turns · ${activity.toolUses || 0} tool calls`,
-      );
-      if (activity.activeTools.size > 0) {
-        const toolsList = Array.from(activity.activeTools.values()).join(", ");
-        lines.push(this.theme.bold(this.theme.fg("accent", "Running Tool: ")) + toolsList);
-      }
-      if (activity.responseText) {
-        lines.push(this.theme.bold("Recent Output:"));
-        const preview = sanitizeDisplayText(activity.responseText.slice(-200));
-        lines.push(this.theme.fg("dim", truncateToWidth(preview, width)));
-      }
-    }
-
     // Lineage
-    lines.push(this.theme.fg("dim", "─".repeat(width)));
     lines.push(
       this.theme.bold("Lineage: ") +
         `Spawned by ${record.parentAgentId ? record.parentAgentId : "main"}`,
     );
 
-    // Artifacts
-    if (record.outputFile) {
-      lines.push(this.theme.bold("Transcript: ") + this.theme.fg("dim", record.outputFile));
-    }
-    if (record.worktree) {
-      lines.push(this.theme.bold("Worktree: ") + this.theme.fg("dim", record.worktree.path));
+    // Live transcript separator
+    lines.push(this.theme.fg("accent", "─── Live Transcript ──────────────────────────────────────────────────────────"));
+
+    // Build transcript entries
+    const transcriptLines = this.buildTranscriptContent(record, width);
+    lines.push(...transcriptLines);
+
+    // Scrolling logic
+    const totalLines = lines.length;
+    const maxScroll = Math.max(0, totalLines - rows);
+
+    if (this.autoScroll && record.status === "running") {
+      this.detailScrollOffset = maxScroll;
+    } else {
+      this.detailScrollOffset = Math.max(0, Math.min(this.detailScrollOffset, maxScroll));
     }
 
-    // Apply scroll offset
-    const maxScroll = Math.max(0, lines.length - rows);
-    this.detailScrollOffset = Math.min(this.detailScrollOffset, maxScroll);
     const visible = lines.slice(this.detailScrollOffset, this.detailScrollOffset + rows);
     while (visible.length < rows) visible.push("");
     return visible.slice(0, rows);
+  }
+
+  private buildTranscriptContent(record: AgentRecord, width: number): string[] {
+    const tLines: string[] = [];
+    const innerW = Math.max(20, width - 2);
+
+    // If active session has messages:
+    const messages = record.session?.messages;
+    if (messages && messages.length > 0) {
+      for (const msg of messages) {
+        if (msg.role === "user") {
+          const text = typeof msg.content === "string" ? msg.content : extractText(msg.content);
+          if (!text.trim()) continue;
+          tLines.push(this.theme.fg("accent", "❯ User:"));
+          for (const line of wrapTextWithAnsi(text.trim(), innerW)) {
+            tLines.push(`  ${this.theme.fg("dim", line)}`);
+          }
+        } else if (msg.role === "assistant") {
+          tLines.push(this.theme.bold("◆ Assistant:"));
+          if (Array.isArray(msg.content)) {
+            for (const c of msg.content) {
+              if (c.type === "text" && c.text) {
+                for (const line of wrapTextWithAnsi(c.text.trim(), innerW)) {
+                  tLines.push(`  ${line}`);
+                }
+              } else if (c.type === "toolCall") {
+                const toolName = (c as any).name || (c as any).toolName || "tool";
+                const args = (c as any).arguments || (c as any).args;
+                const argsPreview = args ? truncateToWidth(JSON.stringify(args), innerW - toolName.length - 8) : "";
+                tLines.push(`  ${this.theme.fg("accent", `⚙ ${toolName}`)} ${this.theme.fg("dim", argsPreview)}`);
+              }
+            }
+          } else if (typeof (msg.content as any) === "string") {
+            for (const line of wrapTextWithAnsi((msg.content as any).trim(), innerW)) {
+              tLines.push(`  ${line}`);
+            }
+          }
+        } else if (msg.role === "toolResult") {
+          const text = typeof msg.content === "string" ? msg.content : extractText(msg.content);
+          const snippet = truncateToWidth(text.replace(/[\r\n\t]+/g, " ").trim(), innerW - 6);
+          if (snippet) {
+            tLines.push(`  ${this.theme.fg("dim", `↳ ${snippet}`)}`);
+          }
+        }
+      }
+    } else if (record.outputFile && existsSync(record.outputFile)) {
+      // If session is closed, read recent lines from transcript file
+      try {
+        const content = readFileSync(record.outputFile, "utf-8");
+        const rawLines = content.split("\n").filter(l => l.trim()).slice(-30);
+        for (const raw of rawLines) {
+          try {
+            const parsed = JSON.parse(raw);
+            if (parsed.type === "message") {
+              const role = parsed.message?.role;
+              const text = parsed.message?.content ? extractText(parsed.message.content) : "";
+              if (text) {
+                tLines.push(this.theme.fg("dim", `[${role}] ${truncateToWidth(text, innerW - 10)}`));
+              }
+            }
+          } catch {
+            tLines.push(this.theme.fg("dim", truncateToWidth(raw, innerW)));
+          }
+        }
+      } catch {
+        tLines.push(this.theme.fg("dim", `(reading from ${record.outputFile})`));
+      }
+    }
+
+    // Active real-time updates while agent is thinking or running tools
+    const activity = this.agentActivity.get(record.id);
+    if (activity) {
+      if (activity.activeTools && activity.activeTools.size > 0) {
+        for (const toolName of activity.activeTools.values()) {
+          tLines.push(this.theme.fg("accent", `  ⚡ Running tool: ${toolName}...`));
+        }
+      }
+      if (activity.responseText) {
+        tLines.push(this.theme.bold("◆ Assistant (generating):"));
+        const recent = activity.responseText.slice(-400).trim();
+        for (const line of wrapTextWithAnsi(recent, innerW)) {
+          tLines.push(`  ${this.theme.fg("dim", line)}`);
+        }
+      }
+    }
+
+    if (tLines.length === 0) {
+      tLines.push(this.theme.fg("dim", "  (waiting for first message or tool execution...)"));
+    }
+
+    return tLines;
   }
 
   // ---- Chrome borders ----
@@ -757,7 +902,7 @@ export class AgentHub implements Component {
     return `${this.theme.fg("border", "│")} ${fit(content, Math.max(0, width - 4))} ${this.theme.fg("border", "│")}`;
   }
 
-  private splitRow(sidebar: string, body: string, width: number, sidebarWidth: number, bodyWidth: number): string {
+  private splitRow(sidebar: string, body: string, sidebarWidth: number, bodyWidth: number): string {
     const bar = this.theme.fg("border", "│");
     return `${bar} ${fit(sidebar, sidebarWidth)} ${bar} ${fit(body, bodyWidth)} ${bar}`;
   }
