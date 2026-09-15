@@ -19,7 +19,7 @@ import { createViewerKeys, type ViewerKeybindings, type ViewerKeys } from "./vie
 const CHROME_LINES_BASE = 6;
 const MIN_VIEWPORT = 3;
 /** Height ceiling shared by the overlay's `maxHeight` and the viewer's internal viewport cap. */
-export const VIEWPORT_HEIGHT_PCT = 70;
+export const VIEWPORT_HEIGHT_PCT = 90;
 
 /**
  * Cap on a single tool result or bash output before the viewer elides the rest.

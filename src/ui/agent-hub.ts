@@ -533,8 +533,8 @@ export class AgentHub implements Component {
   render(width: number): string[] {
     this.lastRenderWidth = width;
     const termRows = process.stdout.rows || 30;
-    // Window 80% of terminal height
-    const height = Math.max(14, Math.floor(termRows * 0.80));
+    // Window 90% of terminal height
+    const height = Math.max(14, Math.floor(termRows * 0.90));
     this.lastRenderHeight = height;
 
     const isSplit = width >= SPLIT_MIN_WIDTH;
@@ -545,9 +545,9 @@ export class AgentHub implements Component {
     const aggregate = this.computeAggregate(records);
 
     if (isSplit) {
-      const rosterWidth = Math.max(ROSTER_MIN_WIDTH, Math.min(Math.floor(width * 0.46), width - DETAIL_MIN_WIDTH - 7));
+      const rosterWidth = Math.max(ROSTER_MIN_WIDTH, Math.min(Math.floor(width * 0.40), width - DETAIL_MIN_WIDTH - 7));
       // Formula: rosterWidth + bodyWidth + 7 = width -> bodyWidth = width - rosterWidth - 7
-      const bodyWidth = Math.max(DETAIL_MIN_WIDTH, width - rosterWidth - 7);
+      const bodyWidth = width - rosterWidth - 7;
 
       const rosterLines = this.renderRosterLines(rosterWidth, contentRows, records, aggregate, depthById, parentById, lastSiblingById);
       const inspectorLines = this.renderInspectorLines(bodyWidth, contentRows, records[this.selectedIndex]);
@@ -694,58 +694,55 @@ export class AgentHub implements Component {
   // ---- Inspector & Live Transcript ----
 
   private renderInspectorLines(width: number, rows: number, record: AgentRecord | undefined): string[] {
-    const lines: string[] = [];
     if (!record) {
-      lines.push(this.theme.fg("dim", "No agent selected."));
-      while (lines.length < rows) lines.push("");
-      return lines.slice(0, rows);
+      const emptyLines = [this.theme.fg("dim", "No agent selected.")];
+      while (emptyLines.length < rows) emptyLines.push("");
+      return emptyLines.slice(0, rows);
     }
 
-    const activity = this.agentActivity.get(record.id);
+    const fixedHeader: string[] = [];
 
-    // Identity and status header
-    lines.push(this.theme.bold(this.theme.fg("accent", `Agent: ${record.handle || record.id}`)));
+    // Identity and status header (FIXED)
+    fixedHeader.push(this.theme.bold(this.theme.fg("accent", `Agent: ${record.handle || record.id}`)));
     const now = Date.now();
     const runtimeStr = record.startedAt > 0 ? formatElapsed((record.completedAt ?? now) - record.startedAt) : "";
-    lines.push(`${this.statusBadge(record.status)}  ${this.theme.fg("dim", `(${runtimeStr})`)}  ${this.theme.fg("dim", `Type: ${record.type}`)}`);
+    fixedHeader.push(
+      `${this.statusBadge(record.status)}  ${this.theme.fg("dim", `(${runtimeStr})`)}  ${this.theme.fg("dim", `Type: ${record.type}`)}`,
+    );
 
     if (record.description) {
-      lines.push(this.theme.fg("dim", "Task: ") + truncateToWidth(sanitizeDisplayText(record.description), width - 6));
+      fixedHeader.push(this.theme.fg("dim", "Task: ") + truncateToWidth(sanitizeDisplayText(record.description), width - 6));
     }
 
-    // Model & Reasoning
+    // Model & Reasoning (FIXED)
     const modelObj = record.session?.model;
     if (modelObj) {
-      lines.push(this.theme.bold("Model: ") + modelObj.id);
+      fixedHeader.push(this.theme.bold("Model: ") + modelObj.id);
     }
 
-    // Usage & Context window gauge
+    // Usage & Context window gauge (FIXED)
     const usage = record.lifetimeUsage;
     if (usage) {
       const tok = getLifetimeTotal(usage);
       const cst = getLifetimeCost(usage);
-      lines.push(this.theme.bold("Usage: ") + `${formatTokens(tok)} tok · ${formatCost(cst)}`);
-
       const contextWindow = (modelObj as any)?.contextWindow || 200_000;
-      lines.push(this.theme.bold("Context: ") + contextGauge(tok, contextWindow, this.theme));
+      const usageStr = `${this.theme.bold("Usage: ")}${formatTokens(tok)} tok · ${formatCost(cst)}`;
+      const gaugeStr = `${this.theme.bold("Context: ")}${contextGauge(tok, contextWindow, this.theme)}`;
+      fixedHeader.push(`${usageStr}  ${gaugeStr}`);
     }
 
-    // Lineage
-    lines.push(
-      this.theme.bold("Lineage: ") +
-        `Spawned by ${record.parentAgentId ? record.parentAgentId : "main"}`,
-    );
+    // Lineage (FIXED)
+    const lineageStr = `Spawned by ${record.parentAgentId ? record.parentAgentId : "main"}` +
+      (record.worktree ? ` · Worktree: ${record.worktree.branch || record.worktree.path}` : "");
+    fixedHeader.push(this.theme.bold("Lineage: ") + this.theme.fg("dim", lineageStr));
 
-    // Live transcript separator
-    lines.push(this.theme.fg("accent", "─── Live Transcript ──────────────────────────────────────────────────────────"));
-
-    // Build transcript entries
+    // Build scrollable transcript content
     const transcriptLines = this.buildTranscriptContent(record, width);
-    lines.push(...transcriptLines);
 
-    // Scrolling logic
-    const totalLines = lines.length;
-    const maxScroll = Math.max(0, totalLines - rows);
+    // Separator line with focus badge and scroll position
+    const totalTranscript = transcriptLines.length;
+    const availableScrollRows = Math.max(3, rows - fixedHeader.length - 1);
+    const maxScroll = Math.max(0, totalTranscript - availableScrollRows);
 
     if (this.autoScroll && record.status === "running") {
       this.detailScrollOffset = maxScroll;
@@ -753,9 +750,19 @@ export class AgentHub implements Component {
       this.detailScrollOffset = Math.max(0, Math.min(this.detailScrollOffset, maxScroll));
     }
 
-    const visible = lines.slice(this.detailScrollOffset, this.detailScrollOffset + rows);
-    while (visible.length < rows) visible.push("");
-    return visible.slice(0, rows);
+    const scrollPos = totalTranscript > availableScrollRows
+      ? ` [${Math.min(totalTranscript, this.detailScrollOffset + availableScrollRows)}/${totalTranscript}]`
+      : "";
+    const activeBadge = this.activePane === "inspector" ? " [Active] " : " ";
+    const sepTitle = `─── Live Transcript${activeBadge}${scrollPos} `;
+    const fillCount = Math.max(0, width - visibleWidth(sepTitle));
+    const sepLine = this.theme.fg("accent", sepTitle + "─".repeat(fillCount));
+
+    const visibleTranscript = transcriptLines.slice(this.detailScrollOffset, this.detailScrollOffset + availableScrollRows);
+
+    const result = [...fixedHeader, sepLine, ...visibleTranscript];
+    while (result.length < rows) result.push("");
+    return result.slice(0, rows);
   }
 
   private buildTranscriptContent(record: AgentRecord, width: number): string[] {

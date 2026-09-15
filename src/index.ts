@@ -4004,7 +4004,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
         },
         {
           overlay: true,
-          overlayOptions: { anchor: "center", width: "80%", maxHeight: "80%" },
+          overlayOptions: { anchor: "center", width: "90%", maxHeight: "90%" },
         },
       );
     } finally {
