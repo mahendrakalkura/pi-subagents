@@ -2947,21 +2947,13 @@ Terse command-style prompts produce shallow, generic work.
     const choice = await ctx.ui.select("Agents", options);
     if (!choice) return;
 
-    if (choice === "Agent Hub (Alt+A)") {
+    if (choice === "Agent Hub (Alt+A)" || choice.startsWith("Running agents (")) {
       await toggleAgentHub(ctx);
       return;
-    } else if (choice.startsWith("Running agents (")) {
-      await showRunningAgents(ctx);
-      await showAgentsMenu(ctx);
-    } else if (choice.startsWith("Agent types (")) {
-      await showAllAgentsList(ctx);
-      await showAgentsMenu(ctx);
-    } else if (choice.startsWith("Scheduled jobs (")) {
-      await showSchedulesMenu(ctx, scheduler);
-      await showAgentsMenu(ctx);
     } else if (choice.startsWith("Workflows (")) {
-      await showWorkflowsMenu(ctx, workflowMenuDeps);
-      await showAgentsMenu(ctx);
+      await toggleAgentHub(ctx, "tree");
+      return;
+    } else if (choice.startsWith("Agent types (")) {
     } else if (choice === "Create new agent") {
       await showCreateWizard(ctx);
     } else if (choice === "Settings") {
@@ -3972,7 +3964,10 @@ Write the file using the write tool. Only write the file, nothing else.`;
   let hubOpen = false;
   let closeHub: (() => void) | undefined;
 
-  async function toggleAgentHub(ctx: ExtensionContext | ExtensionCommandContext): Promise<void> {
+  async function toggleAgentHub(
+    ctx: ExtensionContext | ExtensionCommandContext,
+    initialView: "roster" | "tree" = "roster",
+  ): Promise<void> {
     if (hubOpen && closeHub) {
       closeHub();
       return;
@@ -3990,7 +3985,11 @@ Write the file using the write tool. Only write the file, nothing else.`;
             keybindings,
             done,
             (record) => {
-              void viewAgentConversation(ctx as unknown as ExtensionCommandContext, record);
+              void ctx.ui.input(`Steer "${record.handle || record.id}" with message:`, "").then((msg) => {
+                if (msg && msg.trim()) {
+                  void manager.steer(record.id, msg.trim());
+                }
+              });
             },
             (record) => {
               void ctx.ui.input(`Resume agent "${record.handle || record.id}" with prompt:`, "").then((msg) => {
@@ -4000,6 +3999,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
               });
             },
             isShowCostEnabled(),
+            initialView,
           );
         },
         {

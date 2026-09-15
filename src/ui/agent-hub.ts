@@ -242,10 +242,12 @@ export class AgentHub implements Component {
     private theme: Theme,
     private keybindings: any,
     private done: () => void,
-    private onOpenConversation: (record: AgentRecord) => void,
+    private onSteerAgent?: (record: AgentRecord) => void,
     private onReviveAgent?: (record: AgentRecord) => void,
     private showCost = true,
+    initialViewMode: "roster" | "tree" = "roster",
   ) {
+    this.viewMode = initialViewMode;
     this.timer = setInterval(() => {
       this.tui.requestRender();
     }, TICK_MS);
@@ -509,20 +511,35 @@ export class AgentHub implements Component {
         if (this.onReviveAgent) {
           this.done();
           this.onReviveAgent(selected);
-        } else {
-          this.done();
-          this.onOpenConversation(selected);
         }
       }
       return;
     }
 
-    // Enter: open conversation viewer
+    // Steer running agent: s
+    if (matchesKey(data, "s")) {
+      const selected = records[this.selectedIndex];
+      if (selected && (selected.status === "running" || selected.status === "queued")) {
+        if (this.onSteerAgent) {
+          this.done();
+          this.onSteerAgent(selected);
+        }
+      }
+      return;
+    }
+
+    // Enter: focus transcript inspector (or prompt to steer if already focused)
     if (matchesKey(data, Key.enter)) {
       const selected = records[this.selectedIndex];
-      if (selected) {
+      if (!selected) return;
+      if (this.activePane === "roster") {
+        this.activePane = "inspector";
+        this.tui.requestRender();
+        return;
+      }
+      if (this.onSteerAgent && (selected.status === "running" || selected.status === "queued")) {
         this.done();
-        this.onOpenConversation(selected);
+        this.onSteerAgent(selected);
       }
       return;
     }
@@ -566,8 +583,8 @@ export class AgentHub implements Component {
       const footerText = this.theme.fg(
         "dim",
         this.activePane === "inspector"
-          ? "Tab:roster  ↑/↓:scroll transcript  PgUp/PgDn:page  Home/End:top/bot  Esc:roster"
-          : `j/k:select  Tab:transcript  t:${this.viewMode === "roster" ? "tree" : "flat"}  r:revive  x:kill  Enter:full chat  Esc:close`,
+          ? "Tab/Esc:roster  ↑/↓:scroll  PgUp/PgDn:page  Home/End:top/bot  Enter/s:steer"
+          : `j/k:select  Enter:focus transcript  s:steer  t:${this.viewMode === "roster" ? "tree" : "flat"}  r:revive  x:kill  Esc:close`,
       );
       lines.push(this.row(footerText, width));
       lines.push(this.bottomBorder(width));
@@ -588,8 +605,8 @@ export class AgentHub implements Component {
     const footerText = this.theme.fg(
       "dim",
       this.narrowDetailsOpen
-        ? "Tab:roster  PgUp/PgDn:scroll  Enter:full chat  Esc:roster"
-        : `j/k:select  Tab:transcript  t:${this.viewMode === "roster" ? "tree" : "flat"}  r:revive  x:kill  Enter:open  Esc:close`,
+        ? "Tab/Esc:roster  PgUp/PgDn:scroll  Enter/s:steer"
+        : `j/k:select  Tab:transcript  s:steer  t:${this.viewMode === "roster" ? "tree" : "flat"}  r:revive  x:kill  Esc:close`,
     );
     lines.push(this.row(footerText, width));
     lines.push(this.bottomBorder(width));

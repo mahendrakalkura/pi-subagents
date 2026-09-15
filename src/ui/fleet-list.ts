@@ -412,6 +412,11 @@ export class FleetList {
       this.deactivate();
       return;
     }
+    if (this.openHubCallback) {
+      this.deactivate();
+      this.openHubCallback();
+      return;
+    }
     if (entry.kind === "workflow") {
       // The extension owns this overlay and closes it, so there is no
       // `viewerClose` to hold — but the list still has to know one is up, and
