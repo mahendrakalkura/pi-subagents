@@ -38,6 +38,7 @@ import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitCh
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
 import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type ViewerMarkdownMode, type WidgetMode } from "./types.js";
 import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
+import { AgentHub } from "./ui/agent-hub.js";
 import {
   type AgentActivity,
   type AgentDetails,
@@ -2902,7 +2903,7 @@ Terse command-style prompts produce shallow, generic work.
     const allNames = getAllTypes();
 
     // Build select options
-    const options: string[] = [];
+    const options: string[] = ["Agent Hub (Alt+A)"];
 
     // Running agents entry (only if there are active agents)
     const agents = manager.listAgents().filter(isTopLevelAgent);
@@ -2946,7 +2947,10 @@ Terse command-style prompts produce shallow, generic work.
     const choice = await ctx.ui.select("Agents", options);
     if (!choice) return;
 
-    if (choice.startsWith("Running agents (")) {
+    if (choice === "Agent Hub (Alt+A)") {
+      await toggleAgentHub(ctx);
+      return;
+    } else if (choice.startsWith("Running agents (")) {
       await showRunningAgents(ctx);
       await showAgentsMenu(ctx);
     } else if (choice.startsWith("Agent types (")) {
@@ -3965,9 +3969,72 @@ Write the file using the write tool. Only write the file, nothing else.`;
     ctx.ui.notify(message, level);
   }
 
+  let hubOpen = false;
+  let closeHub: (() => void) | undefined;
+
+  async function toggleAgentHub(ctx: ExtensionContext | ExtensionCommandContext): Promise<void> {
+    if (hubOpen && closeHub) {
+      closeHub();
+      return;
+    }
+    hubOpen = true;
+    try {
+      await ctx.ui.custom<void>(
+        (tui, theme, keybindings, done) => {
+          closeHub = () => done();
+          return new AgentHub(
+            tui,
+            manager,
+            agentActivity,
+            theme,
+            keybindings,
+            done,
+            (record) => {
+              void viewAgentConversation(ctx as unknown as ExtensionCommandContext, record);
+            },
+            (record) => {
+              void ctx.ui.input(`Resume agent "${record.handle || record.id}" with prompt:`, "").then((msg) => {
+                if (msg && msg.trim()) {
+                  void manager.resume(record.id, msg.trim());
+                }
+              });
+            },
+            isShowCostEnabled(),
+          );
+        },
+        {
+          overlay: true,
+          overlayOptions: { anchor: "center", width: "95%", maxHeight: "90%" },
+        },
+      );
+    } finally {
+      hubOpen = false;
+      closeHub = undefined;
+    }
+  }
+
+  fleet.setOpenHub(() => {
+    if (currentCtx) void toggleAgentHub(currentCtx);
+  });
+
+  if (typeof (pi as any).registerShortcut === "function") {
+    (pi as any).registerShortcut("alt+a", {
+      description: "Open or close Agent Hub",
+      handler: async (ctx: ExtensionContext) => {
+        await toggleAgentHub(ctx);
+      },
+    });
+  }
+
   pi.registerCommand("agents", {
-    description: "Manage agents",
-    handler: async (_args, ctx) => { await showAgentsMenu(ctx); },
+    description: "Manage agents (or /agents hub for Agent Hub)",
+    handler: async (args, ctx) => {
+      if (args?.trim() === "hub") {
+        await toggleAgentHub(ctx);
+        return;
+      }
+      await showAgentsMenu(ctx);
+    },
   });
 
   /**

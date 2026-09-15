@@ -122,6 +122,8 @@ export class FleetList {
    * minus the close handle, because that overlay belongs to the extension.
    */
   private viewingWorkflowId: string | undefined;
+  private openHubCallback?: () => void;
+  private lastLeftTap = 0;
 
   constructor(
     private manager: AgentManager,
@@ -270,6 +272,10 @@ export class FleetList {
     this.openWorkflow = open;
   }
 
+  setOpenHub(open: () => void): void {
+    this.openHubCallback = open;
+  }
+
   /** Live runs, plus recently settled ones — the same linger the agents get. */
   private workflows(): FleetWorkflow[] {
     if (!this.workflowSource) return [];
@@ -311,6 +317,15 @@ export class FleetList {
     // emits both, and matchesKey matches either) — act on press only, or every
     // tap would move/fire twice. Repeats still pass through for held-key nav.
     if (isKeyRelease(data)) return undefined;
+
+    // Alt+A toggles Agent Hub from any state
+    if (matchesKey(data, "alt+a") || data === "\x1ba" || data === "\x1bA") {
+      if (this.openHubCallback) {
+        this.openHubCallback();
+        return { consume: true };
+      }
+    }
+
     // While an overlay is open, let it own all input. Checked before the focus
     // test below, which would otherwise read the dialog holding the keyboard as
     // "the user left the list" and reset the selection out from under it.
@@ -325,6 +340,17 @@ export class FleetList {
     }
 
     if (!this.active) {
+      // Double-tap left at empty prompt opens Agent Hub if agents exist
+      if (matchesKey(data, "left") && this.ui.getEditorText() === "" && this.roster().length > 1) {
+        const now = Date.now();
+        if (now - this.lastLeftTap < 500 && this.openHubCallback) {
+          this.lastLeftTap = 0;
+          this.openHubCallback();
+          return { consume: true };
+        }
+        this.lastLeftTap = now;
+      }
+
       // Activate: ↓ or ← at an empty prompt moves focus into the list.
       const isActivator = matchesKey(data, "down") || matchesKey(data, "left");
       // Gated on the roster, not the agents: a session whose only row is a
