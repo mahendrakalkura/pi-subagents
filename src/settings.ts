@@ -240,6 +240,16 @@ export interface SubagentsSettings {
    * meaning one thing here and another in the resolver.
    */
   fallbackSubagent?: string;
+
+  /**
+   * Extension entry paths every agent loads in addition to whatever its own
+   * `extensions:` resolves to. Inline extensions compiled into a Pi binary are
+   * invisible to a subagent, because a child session builds its own resource
+   * loader and discovers extensions from disk only. Anything a subagent must
+   * inherit from the parent binary - request shaping, credential handling,
+   * model failover - has to be named here by its source path.
+   */
+  defaultExtensions?: string[];
   /**
    * Whether this extension's tool results carry a `usage` field, so subagent
    * spend reaches the parent session's own accounting. Defaults to `false`.
@@ -328,6 +338,7 @@ export interface SettingsAppliers {
   setWorkflowsEnabled: (b: boolean) => void;
   setMaxSubagentDepth: (n: number) => void;
   setFallbackSubagent: (v: string | undefined) => void;
+  setDefaultExtensions: (paths: string[]) => void;
   setReportUsage: (b: boolean) => void;
   setShowCost: (b: boolean) => void;
   setShowModel: (b: boolean) => void;
@@ -451,6 +462,10 @@ function sanitize(raw: unknown): SubagentsSettings {
   if (typeof r.workflowsEnabled === "boolean") {
     out.workflowsEnabled = r.workflowsEnabled;
   }
+  if (Array.isArray(r.defaultExtensions)) {
+    const paths = r.defaultExtensions.filter((entry): entry is string => typeof entry === "string" && entry.trim() !== "");
+    if (paths.length > 0) out.defaultExtensions = paths.map((entry) => entry.trim());
+  }
   if (r.fallbackSubagent === false) {
     // The only non-string spelling worth accepting: a boolean would otherwise be
     // dropped, silently leaving the PERMISSIVE default in place. Every string is
@@ -519,6 +534,7 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   if (typeof s.graceTurns === "number") appliers.setGraceTurns(s.graceTurns);
   if (typeof s.maxSubagentDepth === "number") appliers.setMaxSubagentDepth(s.maxSubagentDepth);
   if (typeof s.fallbackSubagent === "string") appliers.setFallbackSubagent(s.fallbackSubagent);
+  if (Array.isArray(s.defaultExtensions)) appliers.setDefaultExtensions(s.defaultExtensions);
   if (s.defaultJoinMode) appliers.setDefaultJoinMode(s.defaultJoinMode);
   if (typeof s.backgroundByDefault === "boolean") appliers.setBackgroundByDefault(s.backgroundByDefault);
   if (typeof s.schedulingEnabled === "boolean") appliers.setSchedulingEnabled(s.schedulingEnabled);

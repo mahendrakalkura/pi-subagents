@@ -349,6 +349,32 @@ export function getRememberAgents(): boolean { return rememberAgents; }
 /** Set whether subagent sessions are persisted by default. */
 export function setRememberAgents(b: boolean): void { rememberAgents = b; }
 
+/**
+ * Extension entry paths every agent loads on top of its own `extensions:`.
+ * A child session builds its own resource loader and discovers extensions from
+ * disk, so extensions compiled into the host binary never reach a subagent.
+ * These paths are how the parent's request shaping and credential handling
+ * follow it down.
+ */
+let defaultExtensionPaths: string[] = [];
+
+/** Get the extension paths every agent inherits. */
+export function getDefaultExtensions(): string[] { return defaultExtensionPaths; }
+/** Set the extension paths every agent inherits. */
+export function setDefaultExtensions(paths: string[]): void { defaultExtensionPaths = [...paths]; }
+
+/**
+ * An agent's `extensions:` with the inherited paths folded in. `true` becomes an
+ * explicit wildcard so the paths can ride alongside it without narrowing the set
+ * the agent would otherwise have loaded. `false` is left alone: an agent that
+ * asked for no extensions gets none.
+ */
+export function withDefaultExtensions(extensions: boolean | string[] | undefined): boolean | string[] | undefined {
+  if (extensions === false || defaultExtensionPaths.length === 0) return extensions;
+  if (extensions === true || extensions === undefined) return ["*", ...defaultExtensionPaths];
+  return [...extensions, ...defaultExtensionPaths];
+}
+
 /** Additional turns allowed after the soft limit steer message. */
 let graceTurns = 5;
 
@@ -708,10 +734,11 @@ export async function runAgent(
   const { extNames, narrowing } = parseExtSelectors(
     options.isolated ? [] : (agentConfig?.extSelectors ?? []),
   );
-  const noExtensions = extensions === false;
+  const effectiveExtensions = withDefaultExtensions(extensions);
+  const noExtensions = effectiveExtensions === false;
 
-  const extensionsSpec = Array.isArray(extensions)
-    ? parseExtensionsSpec(extensions, configCwd)
+  const extensionsSpec = Array.isArray(effectiveExtensions)
+    ? parseExtensionsSpec(effectiveExtensions, configCwd)
     : undefined;
   const keepNames = extensionsSpec?.names ?? new Set<string>();
   // `exclude_extensions:` is a denylist applied AFTER the include set — exclude wins.
@@ -723,7 +750,7 @@ export async function runAgent(
   // The override filters loaded extensions down to `keepNames` minus `excludeNames`.
   // It's only needed when we're neither loading everything without excludes
   // (`extensions: true` or a `"*"` wildcard) nor nothing (`noExtensions`).
-  const loadAll = extensions === true || extensionsSpec?.wildcard === true;
+  const loadAll = effectiveExtensions === true || extensionsSpec?.wildcard === true;
   const additionalExtensionPaths = extensionsSpec?.paths.length ? extensionsSpec.paths : undefined;
   // Pre-filter discovered set, captured by the override — the exclude-typo warning
   // must compare against this, not the surviving set (absence from survivors is
